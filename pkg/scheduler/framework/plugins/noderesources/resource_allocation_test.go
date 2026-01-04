@@ -17,7 +17,6 @@ limitations under the License.
 package noderesources
 
 import (
-	"context"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -36,7 +35,6 @@ import (
 	"k8s.io/dynamic-resource-allocation/deviceclass/extendedresourcecache"
 	"k8s.io/dynamic-resource-allocation/resourceslice/tracker"
 	"k8s.io/dynamic-resource-allocation/structured"
-	"k8s.io/klog/v2/ktesting"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -45,6 +43,7 @@ import (
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
+	"k8s.io/kubernetes/test/utils/ktesting"
 	"k8s.io/utils/ptr"
 )
 
@@ -263,6 +262,9 @@ func TestResourceAllocationScorerCalculateRequests(t *testing.T) {
 }
 
 func TestCalculateResourceAllocatableRequest(t *testing.T) {
+	testCalculateResourceAllocatableRequest(ktesting.Init(t))
+}
+func testCalculateResourceAllocatableRequest(tCtx ktesting.TContext) {
 	// Initialize test variables
 	nodeName := "resource-node"
 	driverName := "test-driver"
@@ -451,7 +453,7 @@ func TestCalculateResourceAllocatableRequest(t *testing.T) {
 		},
 		"DRA-backed-resource-with-per-device-node-selection": {
 			enableDRAExtendedResource: true,
-			node:                      st.MakeNode().Name(nodeName).Obj(),
+			node:                      st.MakeNode().Name(nodeName).Label("zone", "us-east-1a").Obj(),
 			extendedResource:          explicitExtendedResource,
 			objects: []apiruntime.Object{
 				&resourceapi.DeviceClass{
@@ -500,13 +502,26 @@ func TestCalculateResourceAllocatableRequest(t *testing.T) {
 								},
 							},
 							{
-								Name:     "device-3",
-								AllNodes: ptr.To(true), // This device matches all nodes
+								Name: "device-3",
+								// Use a node selector to ensure nodeMatches is exercised for this device
+								NodeSelector: &v1.NodeSelector{
+									NodeSelectorTerms: []v1.NodeSelectorTerm{
+										{
+											MatchExpressions: []v1.NodeSelectorRequirement{
+												{
+													Key:      "zone",
+													Operator: v1.NodeSelectorOpIn,
+													Values:   []string{"us-east-1a"},
+												},
+											},
+										},
+									},
+								},
 								Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 									"model": {StringValue: ptr.To("SOME-XZY")},
 								},
 								Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
-									"memory": {Value: resource.MustParse("24Gi")}, // 24GB GPU - matches CEL (>= 8GB)
+									"memory": {Value: resource.MustParse("24Gi")}, // 24GB GPU - matches CEL (>= 8GiB)
 								},
 							},
 						},
@@ -531,56 +546,17 @@ func TestCalculateResourceAllocatableRequest(t *testing.T) {
 					Obj(),
 			},
 			podRequest:          1,
-			expectedAllocatable: 2, // Only device-1 (matches test-node) and device-3 (matches all nodes)
+			expectedAllocatable: 2, // device-1 matches the test node and device-3 matches via its selector
 			expectedRequested:   2, // 1 allocated (device-1) + 1 requested
 		},
 	}
 
 	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
+		tCtx.SyncTest(name, func(tCtx ktesting.TContext) {
 			// Setup environment, create required objects
-			logger, tCtx := ktesting.NewTestContext(t)
-			tCtx, cancel := context.WithCancel(tCtx)
-			defer cancel()
+			featuregatetesting.SetFeatureGateDuringTest(tCtx, utilfeature.DefaultFeatureGate, features.DRAExtendedResource, tc.enableDRAExtendedResource)
 
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DRAExtendedResource, tc.enableDRAExtendedResource)
-
-			client := fake.NewClientset(tc.objects...)
-			informerFactory := informers.NewSharedInformerFactory(client, 0)
-			resourceSliceTrackerOpts := tracker.Options{
-				SliceInformer: informerFactory.Resource().V1().ResourceSlices(),
-				TaintInformer: informerFactory.Resource().V1alpha3().DeviceTaintRules(),
-				ClassInformer: informerFactory.Resource().V1().DeviceClasses(),
-				KubeClient:    client,
-			}
-			resourceSliceTracker, err := tracker.StartTracker(tCtx, resourceSliceTrackerOpts)
-			if err != nil {
-				t.Fatalf("couldn't start resource slice tracker: %v", err)
-			}
-			draManager := dynamicresources.NewDRAManager(
-				tCtx,
-				assumecache.NewAssumeCache(
-					logger,
-					informerFactory.Resource().V1().ResourceClaims().Informer(),
-					"resource claim",
-					"",
-					nil),
-				resourceSliceTracker,
-				informerFactory)
-
-			if tc.enableDRAExtendedResource {
-				cache := draManager.DeviceClassResolver().(*extendedresourcecache.ExtendedResourceCache)
-				if _, err := informerFactory.Resource().V1().DeviceClasses().Informer().AddEventHandler(cache); err != nil {
-					logger.Error(err, "failed to add device class informer event handler")
-				}
-			}
-
-			informerFactory.Start(tCtx.Done())
-			t.Cleanup(func() {
-				// Now we can wait for all goroutines to stop.
-				informerFactory.Shutdown()
-			})
-			informerFactory.WaitForCacheSync(tCtx.Done())
+			draManager := newTestDRAManager(tCtx, tc.objects...)
 
 			nodeInfo := framework.NewNodeInfo()
 			nodeInfo.SetNode(tc.node)
@@ -599,20 +575,67 @@ func TestCalculateResourceAllocatableRequest(t *testing.T) {
 				var status *fwk.Status
 				draPreScoreState, status = getDRAPreScoredParams(draManager, []config.ResourceSpec{{Name: string(tc.extendedResource)}})
 				if status != nil {
-					t.Fatalf("getting DRA pre-scored params failed: %v", status)
+					tCtx.Fatalf("getting DRA pre-scored params failed: %v", status)
 				}
 			}
 
 			// Test calculateResourceAllocatableRequest API
 			allocatable, requested := scorer.calculateResourceAllocatableRequest(tCtx, nodeInfo, tc.extendedResource, tc.podRequest, draPreScoreState)
 			if !cmp.Equal(allocatable, tc.expectedAllocatable) {
-				t.Errorf("Expected allocatable=%v, but got allocatable=%v", tc.expectedAllocatable, allocatable)
+				tCtx.Errorf("Expected allocatable=%v, but got allocatable=%v", tc.expectedAllocatable, allocatable)
 			}
 			if !cmp.Equal(requested, tc.expectedRequested) {
-				t.Errorf("Expected requested=%v, but got requested=%v", tc.expectedRequested, requested)
+				tCtx.Errorf("Expected requested=%v, but got requested=%v", tc.expectedRequested, requested)
 			}
 		})
 	}
+}
+
+// newTestDRAManager creates a DefaultDRAManager for testing purposes.
+// Only usable in a syntest bubble.
+func newTestDRAManager(tCtx ktesting.TContext, objects ...apiruntime.Object) *dynamicresources.DefaultDRAManager {
+	tCtx = ktesting.WithCancel(tCtx)
+	client := fake.NewClientset(objects...)
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	resourceSliceTrackerOpts := tracker.Options{
+		SliceInformer: informerFactory.Resource().V1().ResourceSlices(),
+		TaintInformer: informerFactory.Resource().V1alpha3().DeviceTaintRules(),
+		ClassInformer: informerFactory.Resource().V1().DeviceClasses(),
+		KubeClient:    client,
+	}
+	resourceSliceTracker, err := tracker.StartTracker(tCtx, resourceSliceTrackerOpts)
+	tCtx.ExpectNoError(err, "couldn't start resource slice tracker")
+	draManager := dynamicresources.NewDRAManager(
+		tCtx,
+		assumecache.NewAssumeCache(
+			tCtx.Logger(),
+			informerFactory.Resource().V1().ResourceClaims().Informer(),
+			"resource claim",
+			"",
+			nil),
+		resourceSliceTracker,
+		informerFactory)
+
+	cache := draManager.DeviceClassResolver().(*extendedresourcecache.ExtendedResourceCache)
+	handle, err := informerFactory.Resource().V1().DeviceClasses().Informer().AddEventHandler(cache)
+	tCtx.ExpectNoError(err, "add device class informer event handler")
+	tCtx.Cleanup(func() {
+		_ = informerFactory.Resource().V1().DeviceClasses().Informer().RemoveEventHandler(handle)
+	})
+
+	informerFactory.Start(tCtx.Done())
+	tCtx.Cleanup(func() {
+		tCtx.Cancel("test has completed")
+		// Now we can wait for all goroutines to stop.
+		informerFactory.Shutdown()
+	})
+	informerFactory.WaitForCacheSync(tCtx.Done())
+
+	// Wait for full initialization of manager, including
+	// processing of all informer events.
+	tCtx.Wait()
+
+	return draManager
 }
 
 // getCachedDeviceMatch checks the cache for a DeviceMatches result
@@ -839,6 +862,45 @@ func TestNodeMatchCaching(t *testing.T) {
 			assert.True(t, found2, "Result should be found in cache")
 			assert.Equal(t, tc.expectedMatch, matches2, "Cached result should match expected value")
 		})
+	}
+}
+
+func TestNodeMatchesCacheHit(t *testing.T) {
+	scorer := &resourceAllocationScorer{
+		DRACaches: DRACaches{
+			celCache: cel.NewCache(1, cel.Features{}),
+		},
+	}
+
+	node := st.MakeNode().Name("cache-node").Label("zone", "us-east-1a").Obj()
+	selector := &v1.NodeSelector{
+		NodeSelectorTerms: []v1.NodeSelectorTerm{
+			{
+				MatchExpressions: []v1.NodeSelectorRequirement{
+					{
+						Key:      "zone",
+						Operator: v1.NodeSelectorOpIn,
+						Values:   []string{"us-east-1a"},
+					},
+				},
+			},
+		},
+	}
+
+	firstMatch, err := scorer.nodeMatches(node, "", false, selector)
+	if err != nil {
+		t.Fatalf("unexpected error while evaluating selector: %v", err)
+	}
+	if !firstMatch {
+		t.Fatalf("expected nodeMatches to return true for the selector")
+	}
+
+	secondMatch, err := scorer.nodeMatches(node, "", false, selector)
+	if err != nil {
+		t.Fatalf("unexpected error while hitting cache: %v", err)
+	}
+	if !secondMatch {
+		t.Fatalf("expected cached nodeMatches to be true")
 	}
 }
 

@@ -655,7 +655,11 @@ func (pl *DynamicResources) Filter(ctx context.Context, cs fwk.CycleState, pod *
 			// If the claim is not ready yet (ready false, no error) and binding has timed out
 			// or binding has failed (err non-nil), then the scheduler should consider deallocating this
 			// claim in PostFilter to unblock trying other devices.
-			if err != nil || !ready && pl.isClaimTimeout(claim) {
+			if err != nil {
+				logger.V(5).Info("Claim failed binding conditions check", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaim", klog.KObj(claim), "err", err)
+				unavailableClaims = append(unavailableClaims, index)
+			} else if !ready && pl.isClaimTimeout(claim) {
+				logger.V(5).Info("Claim timed out waiting for binding conditions", "pod", klog.KObj(pod), "node", klog.KObj(node), "resourceclaim", klog.KObj(claim))
 				unavailableClaims = append(unavailableClaims, index)
 			}
 		}
@@ -969,7 +973,7 @@ func (pl *DynamicResources) Reserve(ctx context.Context, cs fwk.CycleState, pod 
 			if err != nil {
 				return statusError(logger, fmt.Errorf("internal error, couldn't signal allocation for claim %s", claim.Name))
 			}
-			logger.V(5).Info("Reserved resource in allocation result", "claim", klog.KObj(claim), "allocation", klog.Format(allocation))
+			logger.V(5).Info("Reserved resource in allocation result", "claim", klog.KObj(claim), "uid", claim.UID, "resourceVersion", claim.ResourceVersion, "allocation", klog.Format(allocation))
 			allocIndex++
 		}
 	}
@@ -998,6 +1002,7 @@ func (pl *DynamicResources) Unreserve(ctx context.Context, cs fwk.CycleState, po
 		// If allocation was in-flight, then it's not anymore and we need to revert the
 		// claim object in the assume cache to what it was before.
 		if deleted := pl.draManager.ResourceClaims().RemoveClaimPendingAllocation(claim.UID); deleted {
+			logger.V(5).Info("Released resource in allocation result", "claim", klog.KObj(claim), "uid", claim.UID, "resourceVersion", claim.ResourceVersion, "allocation", klog.Format(claim.Status.Allocation))
 			pl.draManager.ResourceClaims().AssumedClaimRestore(claim.Namespace, claim.Name)
 		}
 
@@ -1138,7 +1143,14 @@ func (pl *DynamicResources) bindClaim(ctx context.Context, state *stateData, ind
 		}
 		if allocation != nil {
 			for _, claimUID := range claimUIDs {
-				pl.draManager.ResourceClaims().RemoveClaimPendingAllocation(claimUID)
+				if deleted := pl.draManager.ResourceClaims().RemoveClaimPendingAllocation(claimUID); deleted {
+					// Creating the claim may have failed.
+					resourceVersion := ""
+					if claim != nil {
+						resourceVersion = claim.ResourceVersion
+					}
+					logger.V(5).Info("Released resource in allocation result", "claim", klog.KObj(claim), "uid", claimUID, "resourceVersion", resourceVersion, "allocation", klog.Format(allocation))
+				}
 			}
 		}
 	}()
